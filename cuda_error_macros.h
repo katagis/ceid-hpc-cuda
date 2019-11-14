@@ -18,7 +18,7 @@ if (CE_LINEVAR != cudaSuccess) { \
 			cudaGetErrorString(CE_LINEVAR) \
 	); \
 	cudaDeviceReset(); \
-	exit(1); \
+	abort(); \
 } do{}while(0)
 
 
@@ -31,7 +31,7 @@ if (STATUS != cudaSuccess) { \
 			cublasGetErrorString(STATUS) \
 	); \
 	cudaDeviceReset(); \
-	exit(1); \
+	abort(); \
 } do{}while(0)
 
 const char* cublasGetErrorString(cublasStatus_t status)

@@ -19,8 +19,6 @@ struct Matrix {
 	Matrix(int inCols, int inRows) {
 		cols = inCols;
 		rows = inRows;
-
-		AllocHost();
 	}
 
 	// Expects row major order in inData
@@ -48,16 +46,19 @@ struct Matrix {
 	// Move & Copy Operators
 	//
 
-	// Move assignment
+	// Move assignment, transfer the owned memory to the other matrix without copy
 	Matrix& operator=(Matrix&& other) {
+		// Cleanup whatever is currently allocated
 		FreeHost();
 		FreeDevice();
 
+		// Copy pointers & data
 		data = other.data;
 		dev_data = other.dev_data;
 		cols = other.cols;
 		rows = other.rows;
 
+		// Remember to modify these to prevent free from 'other' matrix
 		other.data = nullptr;
 		other.dev_data = nullptr;
 		return *this;
@@ -156,6 +157,9 @@ struct Matrix {
 	//
 	// Misc utilities
 	//
+	float** Dev_As2D() {
+		return (float**)dev_data;
+	}
 
 	int Size() {
 		return rows * cols;
@@ -184,5 +188,19 @@ struct Matrix {
 			}
 		}
 		return t;
+	}
+
+	// Compares Host Data with "other's" data. Costs O(N) when equal because we need to apply delta to each value
+	bool IsNearlyEqual(const Matrix& other, float delta = 1e-3) {
+		if (cols != other.cols || rows != other.rows) {
+			return false;
+		}
+
+		for (int i = 0; i < Size(); ++i) {
+			if (abs(data[i] - other.data[i]) > delta) {
+				return false;
+			}
+		}
+		return true;
 	}
 };
