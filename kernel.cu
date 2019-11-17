@@ -11,6 +11,28 @@ float cublassTime = 0.f;
 float basicTime = 0.f;
 float optimisedTime = 0.f;
 
+Matrix GetRandomInputMatrix() {
+	constexpr int TestRows = 1601;
+	constexpr int TestCols = 1601;
+
+	Matrix inputMatrix(TestCols, TestRows);
+	inputMatrix.AllocHost();
+
+	for (int i = 0; i < inputMatrix.Size(); ++i) {
+		inputMatrix.data[i] = std::rand() % 64;
+	}
+
+	return std::move(inputMatrix);
+}
+
+Matrix GetCustomInputMatrix() {
+	return std::move(Matrix(4, {
+		0,  1,  2,  3,
+		10, 11, 12, 13,
+		20, 21, 22, 23
+	}));
+}
+
 // Returns milliseconds for the time Function f took.
 template<typename Function>
 float CountTime(Function&& f) {
@@ -30,9 +52,14 @@ float CountTime(Function&& f) {
 	return milliseconds;
 }
 
+// Integer division + ceil if remainder
+int div_ceil(int lhs, int rhs) {
+	return lhs / rhs + (lhs % rhs == 0 ? 0 : 1);
+}
+
 Matrix cublas_Tmultiply(Matrix& inputMatrix) {
-	const float alpha = 1;
-	const float beta = 0;
+	const double alpha = 1;
+	const double beta = 0;
 
 	Matrix result(inputMatrix.cols, inputMatrix.cols);
 	result.AllocDevice();
@@ -46,7 +73,7 @@ Matrix cublas_Tmultiply(Matrix& inputMatrix) {
 	int M = inputMatrix.rows;
 
 	cublassTime = CountTime([&]() {
-		status = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, N, M, &alpha,
+		status = cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, N, M, &alpha,
 							 inputMatrix.dev_data, M, inputMatrix.dev_data, M, &beta, result.dev_data, N);
 	});
 	CBE(status);
@@ -67,18 +94,23 @@ Matrix cublas_Tmultiply(Matrix& inputMatrix) {
 //
 // SIMPLE CUDA
 //
-__global__ void basic_dev_Tmultiply(int nr_rows, int nr_cols, float* src, float* result)
+__global__ void basic_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double* result)
 {
-	int row = threadIdx.x / nr_cols;
-	int col = threadIdx.x % nr_cols;
+	const int row = blockIdx.y * blockDim.y + threadIdx.y;
+	const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (row >= nr_cols || col >= nr_cols) {
+		return;
+	}
 	
-	float sum = 0;
+	double elem = 0;
 
 	for (int i = 0; i < nr_rows; ++i) {
-		sum += src[AT(i, row, nr_cols)] * src[AT(i, col, nr_cols)];
+		elem += src[AT(i, row, nr_cols)] * src[AT(i, col, nr_cols)];
 	}
 
-	result[AT(row, col, nr_cols)] = sum;
+	result[AT(row, col, nr_cols)] = elem;
+
 }
 
 Matrix basic_Tmutliply(Matrix& input) {
@@ -87,8 +119,14 @@ Matrix basic_Tmutliply(Matrix& input) {
 
 	input.IntoDevMatrix();
 
+	constexpr int Threads = 32;
+	const int GridSize = div_ceil(input.cols, Threads);
+
+	dim3 block(Threads, Threads);
+	dim3 grid(GridSize, GridSize);
+
 	basicTime = CountTime([&]() {
-		basic_dev_Tmultiply << <1, result.Size() >> > (input.rows, input.cols, input.dev_data, result.dev_data);
+		basic_dev_Tmultiply << <grid, block>> > (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
 
 	result.FromDevMatrix();
@@ -101,28 +139,6 @@ Matrix basic_Tmutliply(Matrix& input) {
 
 Matrix opt_Tmutliply(Matrix& input);
 
-Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 525;
-	constexpr int TestCols = 30;
-
-	Matrix inputMatrix(TestCols, TestRows);
-	inputMatrix.AllocHost();
-
-	for (int i = 0; i < inputMatrix.Size(); ++i) {
-		inputMatrix.data[i] = std::rand() % 64;
-	}
-
-
-	return std::move(inputMatrix);
-}
-
-Matrix GetCustomInputMatrix() {
-	return std::move(Matrix(4, {
-		0,  1,  2,  3,
-		10, 11, 12, 13,
-		20, 21, 22, 23
-	}));
-}
 
 int main() {
 //	Matrix inputMatrix = GetCustomInputMatrix();
@@ -132,21 +148,16 @@ int main() {
 
 	Matrix cublasResult;
 	cublasResult = cublas_Tmultiply(inputMatrix);
-	
+	printf("Result: \n");
+
 	Matrix basicCudaResult;
 	basicCudaResult = basic_Tmutliply(inputMatrix);
 
-	if (cublasResult.IsNearlyEqual(basicCudaResult)) {
-		printf("Result: \n");
-		//cublasResult.Print();
-	}
-	else {
-		printf("Different results: \ncublas:\n");
-		cublasResult.Print();
-		printf("simple cuda:\n");
-		basicCudaResult.Print();
+	if (!cublasResult.IsNearlyEqual(basicCudaResult)) {
+		printf("basic cuda had different result than cublass");
 	}
 
+	
 	Matrix optCudaResult;
 	optCudaResult = opt_Tmutliply(inputMatrix);
 
@@ -184,18 +195,6 @@ int main() {
 //    Check if offsets can be applied to make 1 buffer with multiple cuda memcopies.
 // 
 
-__device__ void dev_WriteResult(int nr_rows, int nr_cols, float* src, float* result, int row, int col)
-{
-	float sum = 0;
-
-	for (int i = 0; i < nr_rows; ++i) {
-		sum += src[AT(i, row, nr_cols)] * src[AT(i, col, nr_cols)];
-	}
-
-	result[AT(row, col, nr_cols)] = sum;
-}
-
-
 enum class DebugOutput {
 	Result = 0,
 	RowCol = 1,
@@ -203,14 +202,37 @@ enum class DebugOutput {
 	Block = 3
 };
 
-constexpr int blocksPerThread = 3;
 constexpr DebugOutput debugOutput = DebugOutput::Result;
 
-__global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, float* src, float* result)
+constexpr int BLOCK_SIZE = 32;
+constexpr int TILE_SIZE = 32;
+
+__device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* result, int row, int col)
 {
-	int row = threadIdx.x * blocksPerThread + blockIdx.x;
-	int col = threadIdx.y * blocksPerThread + blockIdx.y;
+	double sum = 0;
+
+	for (int i = 0; i < nr_rows; ++i) {
+		sum += src[AT(i, row, nr_cols)] * src[AT(i, col, nr_cols)];
+	}
+
+	result[AT(row, col, nr_cols)] = sum;
+	result[AT(col, row, nr_cols)] = sum;
+}
+
+
+
+
+__global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double* result)
+{
+	int row = blockIdx.x * blockDim.x + threadIdx.x;
+	int col = blockIdx.y * blockDim.y + threadIdx.y;
 	
+	// Triangular due to symmetry of t(A) * A && border checks
+	if (row > col || col >= nr_cols) {
+		return;
+	}
+
+
 	dev_WriteResult(nr_rows, nr_cols, src, result, row, col);
 
 
@@ -236,18 +258,15 @@ Matrix opt_Tmutliply(Matrix& input) {
 	input.IntoDevMatrix();
 
 
-	int totalSide = input.cols;
-	int threads = totalSide / blocksPerThread;
+	constexpr int Threads = BLOCK_SIZE;
+	const int GridSize = div_ceil(input.cols, TILE_SIZE);
 
-	dim3 dimBlocks(blocksPerThread, blocksPerThread);
-	dim3 dimThreads(threads, threads);
+	dim3 block(Threads, Threads);
+	dim3 grid(GridSize, GridSize);
 	
 
 	optimisedTime = CountTime([&]() {
-
-		// vecAdd <<<numOfBlocks, threadsPerBlock>>>
-
-		opt_dev_Tmultiply << <dimBlocks, dimThreads >> > (input.rows, input.cols, input.dev_data, result.dev_data);
+		opt_dev_Tmultiply <<<grid, block>>> (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
 	result.FromDevMatrix();
 
