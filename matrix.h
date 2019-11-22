@@ -8,8 +8,8 @@
 // Automatically frees both Host & Device memory when going out of scope ensuring no memory leaks.
 struct Matrix {
 	// NOTE: Data is stored in row major. dev_data is dependant on the function IntoDevMatrix used.
-	ArethmT* data{ nullptr };
-	ArethmT* dev_data{ nullptr };
+	double* data{ nullptr };
+	double* dev_data{ nullptr };
 
 	int rows{ 0 };
 	int cols{ 0 };
@@ -22,7 +22,7 @@ struct Matrix {
 	}
 
 	// Expects row major order in inData
-	Matrix(int inCols, std::initializer_list<ArethmT> inData) {
+	Matrix(int inCols, std::initializer_list<double> inData) {
 		size_t size = inData.size();
 
 		cols = inCols;
@@ -30,7 +30,7 @@ struct Matrix {
 
 		AllocHost();
 
-		ArethmT* dataPtr = data;
+		double* dataPtr = data;
 
 		for (auto f : inData) {
 			*(dataPtr++) = f;
@@ -98,14 +98,14 @@ struct Matrix {
 	// Note: CPU data is lost.
 	void AllocHost() {
 		FreeHost();
-		data = (ArethmT*)malloc(Size() * sizeof(ArethmT));
+		data = (double*)malloc(Size() * sizeof(double));
 	}
 
 	// Frees and then (re)allocates new Device memory.
 	// Note: GPU data is lost.
 	void AllocDevice() {
 		FreeDevice();
-		cudaMalloc((void**)&dev_data, Size() * sizeof(ArethmT)) CE;
+		cudaMalloc((void**)&dev_data, Size() * sizeof(double)) CE;
 	}
 
 
@@ -118,7 +118,7 @@ struct Matrix {
 		if (!dev_data) {
 			AllocDevice();
 		}
-		cudaMemcpy(dev_data, (const void*)data, Size() * sizeof(ArethmT), cudaMemcpyHostToDevice); CE;
+		cudaMemcpy(dev_data, (const void*)data, Size() * sizeof(double), cudaMemcpyHostToDevice); CE;
 	}
 
 	// Copies a transposed version of the host buffer to the device buffer. Automatically allocates Device buffer if required.
@@ -127,8 +127,8 @@ struct Matrix {
 			AllocDevice();
 		}
 
-		ArethmT* t = Transposed();
-		cudaMemcpy(dev_data, (const void*)t, Size() * sizeof(ArethmT), cudaMemcpyHostToDevice); CE;
+		double* t = Transposed();
+		cudaMemcpy(dev_data, (const void*)t, Size() * sizeof(double), cudaMemcpyHostToDevice); CE;
 		free(t);
 	}
 
@@ -138,7 +138,7 @@ struct Matrix {
 		if (!data) {
 			AllocHost();
 		}
-		cudaMemcpy(data, dev_data, Size() * sizeof(ArethmT), cudaMemcpyDeviceToHost); CE;
+		cudaMemcpy(data, dev_data, Size() * sizeof(double), cudaMemcpyDeviceToHost); CE;
 	}
 
 	// Copies a transposed version of the Device buffer back to host. Automatically allocates Host buffer if required.
@@ -146,9 +146,9 @@ struct Matrix {
 		if (!data) {
 			AllocHost();
 		}
-		cudaMemcpy(data, dev_data, Size() * sizeof(ArethmT), cudaMemcpyDeviceToHost); CE;
+		cudaMemcpy(data, dev_data, Size() * sizeof(double), cudaMemcpyDeviceToHost); CE;
 		// Transpose and swap.
-		ArethmT* fixed = Transposed();
+		double* fixed = Transposed();
 		free(data);
 		data = fixed;
 	}
@@ -157,15 +157,15 @@ struct Matrix {
 	//
 	// Misc utilities
 	//
-	ArethmT** Dev_As2D() {
-		return (ArethmT**)dev_data;
+	double** Dev_As2D() {
+		return (double**)dev_data;
 	}
 
 	int Size() {
 		return rows * cols;
 	}
 
-	ArethmT At(int i, int j) {
+	double At(int i, int j) {
 		return data[i * cols + j];
 	}
 
@@ -179,8 +179,8 @@ struct Matrix {
 	}
 
 	// mallocs the temporary returned buffer, you should free after use
-	ArethmT* Transposed() {
-		ArethmT* t = (ArethmT*)malloc(Size() * sizeof(ArethmT));
+	double* Transposed() {
+		double* t = (double*)malloc(Size() * sizeof(double));
 
 		for (int i = 0; i < rows; ++i) {
 			for (int j = 0; j < cols; ++j) {
@@ -191,7 +191,7 @@ struct Matrix {
 	}
 
 	// Compares Host Data with "other's" data. Costs O(N) when equal because we need to apply delta to each value
-	bool IsNearlyEqual(const Matrix& other, ArethmT delta = 1e-3) {
+	bool IsNearlyEqual(const Matrix& other, double delta = 1e-3) {
 		if (cols != other.cols || rows != other.rows) {
 			return false;
 		}
