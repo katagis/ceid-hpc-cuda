@@ -14,14 +14,6 @@ float optimisedTime = 0.f;
 
 Matrix GetRandomInputMatrix();
 
-Matrix GetCustomInputMatrix() {
-	return std::move(Matrix(4, {
-		0,  1,  2,  3,
-		10, 11, 12, 13,
-		20, 21, 22, 23
-	}));
-}
-
 // Returns milliseconds for the time Function f took.
 template<typename Function>
 float CountTime(Function&& f) {
@@ -77,8 +69,8 @@ Matrix cublas_Tmultiply(Matrix& inputMatrix) {
 	return std::move(result);
 }
 
-#define AT(row, col, nr_cols) (row * nr_cols + col)
-#define AT_T(row, col, nr_rows) (row + col * nr_rows)
+#define AT(row, col, nr_cols) ((row) * (nr_cols) + (col))
+#define AT_T(row, col, nr_rows) ((row) + ((col)* (nr_rows)))
 
 
 //
@@ -89,7 +81,7 @@ __global__ void basic_dev_Tmultiply(int nr_rows, int nr_cols, double* src, doubl
 	const int row = blockIdx.y * blockDim.y + threadIdx.y;
 	const int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-	if (row >= nr_cols || col >= nr_cols) {
+	if (row < col || row >= nr_cols || col >= nr_cols) {
 		return;
 	}
 	
@@ -100,6 +92,8 @@ __global__ void basic_dev_Tmultiply(int nr_rows, int nr_cols, double* src, doubl
 	}
 
 	result[AT(row, col, nr_cols)] = elem;
+	result[AT(col, row, nr_cols)] = elem;
+
 
 }
 
@@ -129,9 +123,7 @@ Matrix basic_Tmutliply(Matrix& input) {
 
 Matrix opt_Tmutliply(Matrix& input);
 
-
 int main() {
-//	Matrix inputMatrix = GetCustomInputMatrix();
 	Matrix inputMatrix = GetRandomInputMatrix();
 
 	cudaSetDevice(0); CE;
@@ -159,9 +151,6 @@ int main() {
 		printf("cublas:\n");
 		cublasResult.Print();
 
-		printf("src:\n");
-		inputMatrix.Print();
-
 		printf("cuda:\n");
 		optCudaResult.Print();
 	}
@@ -177,8 +166,8 @@ int main() {
 }
 
 Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 5120;
-	constexpr int TestCols = 2560;
+	constexpr int TestRows = 10240;
+	constexpr int TestCols = 10240;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
@@ -187,7 +176,7 @@ Matrix GetRandomInputMatrix() {
 		inputMatrix.data[i] = i % TestCols;
 	}
 
-	for (int i = 0; i < TestRows; ++i) {
+	for (int i = 0; i < TestCols; ++i) {
 		inputMatrix.data[i] = i * 10;
 	}
 
@@ -236,16 +225,18 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 	// transpose(A) * A in practice means we multiply between 2 columns. With this as the base assumption the rest of
 	// the code in this function may use the terms column, column_1 and column_2 meaning the columns from the "src"
 	// that are needed to be multiplyied. This makes the code simpler and easier to read.
-	
-	// Also note that A is in Column-Major
 
-	__shared__ double sm_col_onY[TILE_SIZE][TILE_SIZE];
-	__shared__ double sm_col_onX[TILE_SIZE][TILE_SIZE];
+	// Copying here is a bit different than the usual A*B multiplication
+	// We copy blocks from the required columns directly as squares and use double buffering
+
+	// Also note that A is already in Column-Major (from cpu) to reduce bank conflicts
+
+	__shared__ double sm_col_onY[2][TILE_SIZE][TILE_SIZE];
+	__shared__ double sm_col_onX[2][TILE_SIZE][TILE_SIZE];
 
 	double result = 0.0;
 
 
-	// prepare first loop data...
 
 	// Column to copy for this thread based on the C tile's x
 	const int col_x = block_start_x + tx;
@@ -253,41 +244,54 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 	// Column to copy for this thread based on the C tile's y
 	const int col_y = block_start_y + tx;
 
-	int m;
-	for (m = 0; m < nr_rows; m += TILE_SIZE) {
+	int m = 0;
 
-		// Copying here is a bit different than the usual A*B multiplication
-		// We copy blocks from the required columns directly as squares
-		sm_col_onX[ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
-		sm_col_onY[ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
 
+	sm_col_onX[0][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
+	sm_col_onY[0][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
+
+	for (; m < nr_rows;) {
 		__syncthreads();
 
-#pragma unroll
+		m += TILE_SIZE;
+
+		sm_col_onX[1][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
+		sm_col_onY[1][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
+
+		#pragma unroll
 		for (int k = 0; k < TILE_SIZE; ++k) {
-			result += sm_col_onX[k][tx] * sm_col_onY[k][ty];
+			result += sm_col_onX[0][k][tx] * sm_col_onY[0][k][ty];
 		}
 
-
 		__syncthreads();
+
+		m += TILE_SIZE;
+
+		sm_col_onX[0][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
+		sm_col_onY[0][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
+
+		#pragma unroll
+		for (int k = 0; k < TILE_SIZE; ++k) {
+			result += sm_col_onX[1][k][tx] * sm_col_onY[1][k][ty];
+		}
+
 	}
 
 	output[AT(res_row, res_col, nr_cols)] = result;
 	output[AT(res_col, res_row, nr_cols)] = result;
 }
 
-
-
 __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double* result)
 {
-	int row = blockIdx.x * blockDim.x + threadIdx.x;
-	int col = blockIdx.y * blockDim.y + threadIdx.y;
+	int row = blockIdx.x * TILE_SIZE + threadIdx.x;
+	int col = blockIdx.y * TILE_SIZE + threadIdx.y;
 
-	if (blockIdx.x > blockIdx.y) {
+	if (blockIdx.x < blockIdx.y) {
 		return;
 	}
 
 	dev_WriteResult(nr_rows, nr_cols, src, result, row, col);
+
 
 
 	if (debugOutput == DebugOutput::Result) {
@@ -309,8 +313,9 @@ Matrix opt_Tmutliply(Matrix& input) {
 	Matrix result(input.cols, input.cols);
 	result.AllocDevice();
 
-	input.IntoDevMatrix_ColMajor();
 
+
+	input.IntoDevMatrix_ColMajor();
 
 	constexpr int Threads = BLOCK_SIZE;
 	const int GridSize = div_ceil(input.cols, TILE_SIZE);
@@ -322,6 +327,7 @@ Matrix opt_Tmutliply(Matrix& input) {
 	optimisedTime = CountTime([&]() {
 		opt_dev_Tmultiply <<<grid, block>>> (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
+
 	result.FromDevMatrix();
 
 	input.FreeDevice();

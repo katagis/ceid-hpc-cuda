@@ -16,25 +16,9 @@ struct Matrix {
 
 	Matrix() {}
 
-	Matrix(int inCols, int inRows) {
+	__host__ Matrix(int inCols, int inRows) {
 		cols = inCols;
 		rows = inRows;
-	}
-
-	// Expects row major order in inData
-	Matrix(int inCols, std::initializer_list<double> inData) {
-		size_t size = inData.size();
-
-		cols = inCols;
-		rows = (int)size / cols;
-
-		AllocHost();
-
-		double* dataPtr = data;
-
-		for (auto f : inData) {
-			*(dataPtr++) = f;
-		}
 	}
 
 	~Matrix() {
