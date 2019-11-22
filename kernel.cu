@@ -213,14 +213,16 @@ enum class DebugOutput {
 
 
 Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 5120;
-	constexpr int TestCols = 2560;
+	constexpr int TestRows = 64;
+	constexpr int TestCols = 32;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
 
 	for (int i = 0; i < inputMatrix.Size(); ++i) {
-		inputMatrix.data[i] = i % TestCols;// std::rand() % 64;
+		//inputMatrix.data[i] = i % TestCols + (i / TestCols) * 1000;
+		inputMatrix.data[i] = i % TestCols;
+		//inputMatrix.data[i] = i / TestCols;
 	}
 
 	return std::move(inputMatrix);
@@ -234,8 +236,6 @@ constexpr int ELEM_PT = 2; // SqrtRoot of elements calculated per thread.
 constexpr int TILE_WIDTH = BLOCK_WIDTH * ELEM_PT;
 
 
-
-
 __device__ void dev_WriteResult(int nr_rows, int nr_cols, ArethmT* src, ArethmT* output, int res_row, int res_col)
 {
 	const int bx = blockIdx.x;
@@ -244,10 +244,11 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, ArethmT* src, ArethmT*
 	const int tx = threadIdx.x;
 	const int ty = threadIdx.y;
 
-	ArethmT result = 0.0;
+	const int bs_x = bx * TILE_WIDTH; // Block start x
+	const int bs_y = by * TILE_WIDTH; // Block start y
 
-	const int block_start_x = bx * TILE_WIDTH;
-	const int block_start_y = by * TILE_WIDTH;
+	const int elem_x = bs_x + ELEM_PT * tx; // The actual row,col of the min(x),min(y) elem for this thread
+	const int elem_y = bs_y + ELEM_PT * ty;
 
 
 	// transpose(A) * A in practice means we multiply between 2 columns. With this as the base assumption the rest of
@@ -264,29 +265,79 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, ArethmT* src, ArethmT*
 
 
 
-	// prepare first loop data...
 
-	int m;
-	for (m = 0; m < nr_rows / TILE_WIDTH; ++m) {
+	// Main loop that copies and accumulates results, runs as long as there are more rows.
+	for (int k = 0; k < nr_rows; k += TILE_WIDTH) {
+		
+		// Copy from GLOBAL -> SHARED
+		
+		// Half threads copy onX while the rest copy onY
+		if (tx < BLOCK_WIDTH / 2) {
 
-		// Copying here is a bit different than the usual A*B multiplication
-		// We copy blocks from the required columns directly as squares
-		sm_col_onX[ty][tx] = src[AT(m * TILE_WIDTH + tx, block_start_x + tx, nr_cols)];
-		sm_col_onY[ty][tx] = src[AT(m * TILE_WIDTH + tx, block_start_y + tx, nr_cols)];
+			#pragma unroll
+			for (int i = 0; i < ELEM_PT; ++i) {
+				#pragma unroll
+				for (int j = 0; j < ELEM_PT; ++j) {
 
-		__syncthreads();
+					// All 3 vars in block coordinates
+					const int row1_c = tx + k + i;
+					const int row2_c = (tx * ELEM_PT + BLOCK_WIDTH / 2) + k + i;
+					const int col_c = ty * ELEM_PT + j;
 
+					sm_col_onX[row1_c][col_c] = src[AT(bs_x + row1_c, bs_y + col_c, nr_cols)];
+					sm_col_onX[row2_c][col_c] = src[AT(bs_x + row2_c, bs_y + col_c, nr_cols)];
 
-		for (int k = 0; k < TILE_WIDTH; ++k) {
-			result += sm_col_onX[k][tx] * sm_col_onY[k][ty];
+					output[AT(tx + i, ty + j, nr_cols)] = sm_col_onX[row1_c][col_c];
+				}
+			}
+		}
+		else
+		{
+
+			#pragma unroll
+			for (int i = 0; i < ELEM_PT; ++i) {
+				#pragma unroll
+				for (int j = 0; j < ELEM_PT; ++j) {
+
+					// All 3 vars in block coordinates
+					const int row1_c = ty + k + i;
+					const int row2_c = (ty * ELEM_PT + BLOCK_WIDTH / 2) + k + i;
+					const int col_c = tx * ELEM_PT + j;
+
+					sm_col_onY[row1_c][col_c] = src[AT(bs_x + row1_c, bs_y + col_c, nr_cols)];
+					sm_col_onY[row2_c][col_c] = src[AT(bs_x + row2_c, bs_y + col_c, nr_cols)];
+				}
+			}
 		}
 
+		// END OF: Copy from global -> shared
 
-		__syncthreads();
+
+
+
 	}
 
-	output[AT(res_row, res_col, nr_cols)] = reg_onX[0][tx][ty] + reg_accum[tx][ty];
-	output[AT(res_col, res_row, nr_cols)] = result;
+
+
+
+
+
+
+
+
+
+
+	//// Copy the results to the output
+	//#pragma unroll
+	//for (int i = 0; i < ELEM_PT; ++i) {
+	//	#pragma unroll
+	//	for (int j = 0; j < ELEM_PT; ++j) {
+	//		output[AT(elem_y + j, elem_x + i, nr_cols)] = reg_accum[j][i];
+	//		output[AT(elem_x + i, elem_y + j, nr_cols)] = reg_accum[j][i];
+	//	}
+	//}
+
+
 }
 
 
@@ -310,9 +361,9 @@ __global__ void opt_dev_Tmultiply_NoOdd(int nr_rows, int nr_cols, ArethmT* src, 
 	int row = blockIdx.y * blockDim.y + threadIdx.y;
 	
 	// Triangular due to symmetry of t(A) * A && border checks
-	if (blockIdx.y > blockIdx.x) {
-		return;
-	}
+	//if (blockIdx.y > blockIdx.x) {
+	//	return;
+	//}
 
 	dev_WriteResult(nr_rows, nr_cols, src, result, row, col);
 	
