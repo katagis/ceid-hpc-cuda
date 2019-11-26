@@ -143,17 +143,17 @@ int main() {
 	Matrix optCudaResult;
 	optCudaResult = opt_Tmutliply(inputMatrix);
 
-	//if (cublasResult.IsNearlyEqual(optCudaResult)) {
-	//	printf("Opt cuda was correct.\n");
-	//}
-	//else {
-	//	printf("Opt cuda was different:\n");
-	//	printf("cublas:\n");
-	//	cublasResult.Print();
+	if (cublasResult.IsNearlyEqual(optCudaResult)) {
+		printf("Opt cuda was correct.\n");
+	}
+	else {
+		printf("Opt cuda was different:\n");
+		printf("cublas:\n");
+		cublasResult.Print();
 
-	//	printf("cuda:\n");
-	//	optCudaResult.Print();
-	//}
+		printf("cuda:\n");
+		optCudaResult.Print();
+	}
 
 
 	printf("cuBLASS: %4.4f ms\n", cublassTime);
@@ -174,13 +174,13 @@ enum class DebugOutput {
 
 constexpr DebugOutput debugOutput = DebugOutput::Result;
 
-constexpr int BLOCK_SIZE = 32;
-constexpr int TILE_SIZE = 32;
+constexpr int BLOCK_SIZE = 8;
+constexpr int TILE_SIZE = BLOCK_SIZE;
 
 
 Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 5120;
-	constexpr int TestCols = 5120;
+	constexpr int TestRows = 32;
+	constexpr int TestCols = 32;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
@@ -376,9 +376,9 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output)
 {
-	//if (blockIdx.x < blockIdx.y) {
-	//	return;
-	//}
+	if (blockIdx.y < blockIdx.x * T_GRANUL) {
+		return;
+	}
 
 	const int bx = blockIdx.x;
 	const int by = blockIdx.y * T_GRANUL;
@@ -430,14 +430,16 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 				result[i] += sm_col_onX[k][tx] * sm_col_onY[i][k][ty];
 			}
 		}
-	}
+	} 
 
 	#pragma unroll
 	for (int i = 0; i < T_GRANUL; ++i) {
 		int out_col = col + i * TILE_SIZE;
-		output[AT(row, out_col, nr_cols)] = result[i];
-		//output[AT(out_row, col, nr_cols)] = row + col * 100;
-		//output[AT(out_col, row, nr_cols)] = blockIdx.x + blockIdx.y * 100;// result[i];
+	//	output[AT(row, out_col, nr_cols)] = result[i];
+	//	output[AT(out_col, row, nr_cols)] = result[i];
+		
+		output[AT(row, out_col, nr_cols)] = (blockIdx.x + blockIdx.y * 100 + i * 10000) + 1;
+		output[AT(out_col, row, nr_cols)] = (blockIdx.x + blockIdx.y * 100 + i * 10000) + 1;
 	}
 
 
