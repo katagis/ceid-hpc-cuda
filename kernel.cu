@@ -165,9 +165,22 @@ int main() {
 	return 0;
 }
 
+enum class DebugOutput {
+	Result = 0,
+	RowCol = 1,
+	Thread = 2,
+	Block = 3
+};
+
+constexpr DebugOutput debugOutput = DebugOutput::Result;
+
+constexpr int BLOCK_SIZE = 16;
+constexpr int TILE_SIZE = 16;
+
+
 Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 10240;
-	constexpr int TestCols = 10240;
+	constexpr int TestRows = 32;
+	constexpr int TestCols = 32;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
@@ -199,25 +212,24 @@ Matrix GetRandomInputMatrix() {
 // https://www.seas.upenn.edu/~cis565/Lectures2011S/Lecture12.pdf // Prefetch 
 // https://ecatue.gitlab.io/gpu2018/pages/Cookbook/matrix_multiplication_cuda.html#5 // Shared memory + Bank conflicts
 
-enum class DebugOutput {
-	Result = 0,
-	RowCol = 1,
-	Thread = 2,
-	Block = 3
-};
 
-constexpr DebugOutput debugOutput = DebugOutput::Result;
+// What we tried:
+// Registers: no change
+// Handle Bx == By with a different function: no speed change
+// Reduce overhead by launching half grid for exact triangle: speed got worse
+// Thread Granularity: Worse performance due to exceeding our device's Shared Memory Per block at 2x2 / thread or exceeding registers at 2x1 / per thread. 
+//                     Required dropping double buffering
 
-constexpr int BLOCK_SIZE = 32;
-constexpr int TILE_SIZE = 32;
+// Fixing 
 
-__device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* output, int res_row, int res_col)
+__device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* output, const int res_row, const int res_col)
 {
-	const int bx = blockIdx.x;
-	const int by = blockIdx.y;
 
 	const int tx = threadIdx.x;
 	const int ty = threadIdx.y;
+
+	const int bx = blockIdx.x;
+	const int by = blockIdx.y;
 
 	const int block_start_x = bx * TILE_SIZE;
 	const int block_start_y = by * TILE_SIZE;
@@ -235,7 +247,6 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 	__shared__ double sm_col_onX[2][TILE_SIZE][TILE_SIZE];
 
 	double result = 0.0;
-
 
 
 	// Column to copy for this thread based on the C tile's x
@@ -263,9 +274,13 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 			result += sm_col_onX[0][k][tx] * sm_col_onY[0][k][ty];
 		}
 
+		if (m >= nr_rows) {
+			break;
+		}
 		__syncthreads();
 
 		m += TILE_SIZE;
+
 
 		sm_col_onX[0][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
 		sm_col_onY[0][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
@@ -283,16 +298,15 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 
 __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double* result)
 {
-	int row = blockIdx.x * TILE_SIZE + threadIdx.x;
-	int col = blockIdx.y * TILE_SIZE + threadIdx.y;
-
 	if (blockIdx.x < blockIdx.y) {
 		return;
 	}
 
+	const int row = blockIdx.x * TILE_SIZE + threadIdx.x;
+	const int col = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+
 	dev_WriteResult(nr_rows, nr_cols, src, result, row, col);
-
-
 
 	if (debugOutput == DebugOutput::Result) {
 
@@ -304,10 +318,16 @@ __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double*
 		result[AT(row, col, nr_cols)] = threadIdx.x + threadIdx.y * 100;
 	}
 	else if (debugOutput == DebugOutput::Block) {
-		result[AT(row, col, nr_cols)] =  blockIdx.x + blockIdx.y * 100;
+		result[AT(row, col, nr_cols)] = blockIdx.x + blockIdx.y * 100;
 	}
-
 }
+
+
+
+constexpr int T_GRANUL = 2;
+constexpr int WORK_THREAD = TILE_SIZE / T_GRANUL;
+
+__global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output);
 
 Matrix opt_Tmutliply(Matrix& input) {
 	Matrix result(input.cols, input.cols);
@@ -322,16 +342,113 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 	dim3 block(Threads, Threads);
 	dim3 grid(GridSize, GridSize);
+
 	
 
 	optimisedTime = CountTime([&]() {
-		opt_dev_Tmultiply <<<grid, block>>> (input.rows, input.cols, input.dev_data, result.dev_data);
+		//opt_dev_Tmultiply <<<grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
 
+	printf("Time 1: %f\n", optimisedTime);
+
+
+	//GridSize = div_ceil(input.cols, TILE_SIZE);
+	grid = dim3(GridSize, GridSize / T_GRANUL);
+
+
+	optimisedTime = CountTime([&]() {
+			opt_dev_TmultiplyOdd<< <grid, block>>> (input.rows, input.cols, input.dev_data, result.dev_data);
+		});
+	
 	result.FromDevMatrix();
 
 	input.FreeDevice();
 	result.FreeDevice();
 
 	return result;
+}
+
+// Using different techniques of optimization for Odd columns
+// enables us to disable double buffering for this case and have more registers to work with, 
+// Implements other methods that we tried but found suboptimal
+
+
+
+__global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output)
+{
+	if (blockIdx.x < blockIdx.y) {
+		return;
+	}
+
+	const int row = blockIdx.x * TILE_SIZE + threadIdx.x;
+	const int col = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+	const int tx = threadIdx.x;
+	const int ty = threadIdx.y;
+
+	const int bx = blockIdx.x;
+	const int by = blockIdx.y;
+
+	const int block_start_x = bx * TILE_SIZE;
+	const int block_start_y = by * TILE_SIZE;
+
+	const int threadCopyOffset = ty / WORK_THREAD;
+	// 
+	__shared__ double sm_col_onY[T_GRANUL][WORK_THREAD][TILE_SIZE];
+	__shared__ double sm_col_onX[WORK_THREAD][TILE_SIZE];
+
+	// Column to copy for this thread based on the C tile's x
+	const int col_x = block_start_x + tx;
+
+	// Column to copy for this thread based on the C tile's y
+	const int col_y = block_start_y + tx;
+
+	int m = 0;
+
+	double result[T_GRANUL];
+
+	#pragma unroll
+	for (int i = 0; i < T_GRANUL; ++i) {
+		result[i] = 0.0;
+	}
+
+	for (m = 0; m < nr_rows; m += WORK_THREAD) {
+
+		sm_col_onX[ty % WORK_THREAD][tx] = src[AT_T(m + ty, col_x, nr_rows)];
+		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = src[AT_T(m + ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
+
+		__syncthreads();
+		#pragma unroll
+		for (int i = 0; i < T_GRANUL; ++i) {
+			#pragma unroll
+			for (int k = 0; k < WORK_THREAD; ++k) {
+				result[i] += sm_col_onX[k][tx] * sm_col_onY[i][k][ty];
+			}
+		}
+		
+	}
+
+	#pragma unroll
+	for (int i = 0; i < T_GRANUL; ++i) {
+		int out_col = col + i * TILE_SIZE;
+		output[AT(row, out_col, nr_cols)] = result[i];
+		output[AT(out_col, row, nr_cols)] = result[i];
+	}
+
+
+
+	constexpr DebugOutput db2 = DebugOutput::Result;
+
+	if (db2 == DebugOutput::Result) {
+
+	}
+	else if (db2 == DebugOutput::RowCol) {
+		output[AT(row, col, nr_cols)] = row + col * 100;
+	}
+	else if (db2 == DebugOutput::Thread) {
+		output[AT(row, col, nr_cols)] = threadIdx.x + threadIdx.y * 100;
+	}
+	else if (db2 == DebugOutput::Block) {
+		output[AT(row, col, nr_cols)] = blockIdx.x + blockIdx.y * 100;
+	}
 }
