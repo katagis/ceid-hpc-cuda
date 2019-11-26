@@ -143,17 +143,17 @@ int main() {
 	Matrix optCudaResult;
 	optCudaResult = opt_Tmutliply(inputMatrix);
 
-	//if (cublasResult.IsNearlyEqual(optCudaResult)) {
-	//	printf("Opt cuda was correct.\n");
-	//}
-	//else {
-	//	printf("Opt cuda was different:\n");
-	//	printf("cublas:\n");
-	//	cublasResult.Print();
+	/*if (cublasResult.IsNearlyEqual(optCudaResult)) {
+		printf("Opt cuda was correct.\n");
+	}
+	else {
+		printf("Opt cuda was different:\n");
+		printf("cublas:\n");
+		cublasResult.Print();
 
-	//	printf("cuda:\n");
-	//	optCudaResult.Print();
-	//}
+		printf("cuda:\n");
+		optCudaResult.Print();
+	}*/
 
 
 	printf("cuBLASS: %4.4f ms\n", cublassTime);
@@ -179,8 +179,8 @@ constexpr int TILE_SIZE = 32;
 
 
 Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 5120;
-	constexpr int TestCols = 5120;
+	constexpr int TestRows = 2560;
+	constexpr int TestCols = 2560;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
@@ -324,7 +324,7 @@ __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double*
 
 
 
-constexpr int T_GRANUL = 4;
+constexpr int T_GRANUL = 2;
 constexpr int WORK_THREAD = TILE_SIZE / T_GRANUL;
 
 __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output);
@@ -338,7 +338,7 @@ Matrix opt_Tmutliply(Matrix& input) {
 	input.IntoDevMatrix_ColMajor();
 
 	constexpr int Threads = BLOCK_SIZE;
-	int GridSize = div_ceil(input.cols, TILE_SIZE);
+	const int GridSize = div_ceil(input.cols, TILE_SIZE);
 
 	dim3 block(Threads, Threads);
 	dim3 grid(GridSize, GridSize);
@@ -346,14 +346,12 @@ Matrix opt_Tmutliply(Matrix& input) {
 	
 
 	optimisedTime = CountTime([&]() {
-		//opt_dev_Tmultiply <<<grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
+		opt_dev_Tmultiply <<<grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
 
 	printf("Time 1: %f\n", optimisedTime);
 
-	
-	//GridSize = div_ceil(input.cols, TILE_SIZE);
-	grid = dim3(GridSize, GridSize / T_GRANUL);
+	grid = dim3(GridSize / T_GRANUL, GridSize);
 
 
 	optimisedTime = CountTime([&]() {
@@ -376,28 +374,23 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output)
 {
-	//if (blockIdx.x < blockIdx.y) {
-	//	return;
-	//}
+	if (blockIdx.x < blockIdx.y) {
+		return;
+	}
 
-	const int bx = blockIdx.x;
-	const int by = blockIdx.y * T_GRANUL;
-
-	const int row = bx * TILE_SIZE + threadIdx.x;
-	const int col = by * TILE_SIZE + threadIdx.y;
+	const int row = blockIdx.x * TILE_SIZE + threadIdx.x;
+	const int col = blockIdx.y * TILE_SIZE + threadIdx.y;
 
 	const int tx = threadIdx.x;
 	const int ty = threadIdx.y;
 
-
+	const int bx = blockIdx.x;
+	const int by = blockIdx.y;
 
 	const int block_start_x = bx * TILE_SIZE;
 	const int block_start_y = by * TILE_SIZE;
 
 	const int threadCopyOffset = ty / WORK_THREAD;
-
-	const int cl_ty = threadIdx.y % WORK_THREAD;
-
 	// 
 	__shared__ double sm_col_onY[T_GRANUL][WORK_THREAD][TILE_SIZE];
 	__shared__ double sm_col_onX[WORK_THREAD][TILE_SIZE];
@@ -419,8 +412,8 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 
 	for (m = 0; m < nr_rows; m += WORK_THREAD) {
 
-		sm_col_onX[ty % WORK_THREAD][tx] = src[AT_T(m + cl_ty, col_x, nr_rows)];
-		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = src[AT_T(m + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
+		sm_col_onX[ty % WORK_THREAD][tx] = src[AT_T(m + ty, col_x, nr_rows)];
+		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = src[AT_T(m + ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
 
 		__syncthreads();
 		#pragma unroll
@@ -430,30 +423,11 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 				result[i] += sm_col_onX[k][tx] * sm_col_onY[i][k][ty];
 			}
 		}
+		
 	}
 
-	#pragma unroll
 	for (int i = 0; i < T_GRANUL; ++i) {
-		int out_col = col + i * TILE_SIZE;
-		output[AT(row, out_col, nr_cols)] = result[i];
-		//output[AT(out_row, col, nr_cols)] = row + col * 100;
-		//output[AT(out_col, row, nr_cols)] = blockIdx.x + blockIdx.y * 100;// result[i];
-	}
-
-
-
-	constexpr DebugOutput db2 = DebugOutput::Result;
-
-	if (db2 == DebugOutput::Result) {
-
-	}
-	else if (db2 == DebugOutput::RowCol) {
-		output[AT(row, col, nr_cols)] = row + col * 100;
-	}
-	else if (db2 == DebugOutput::Thread) {
-		output[AT(row, col, nr_cols)] = threadIdx.x + threadIdx.y * 100;
-	}
-	else if (db2 == DebugOutput::Block) {
-		output[AT(row, col, nr_cols)] = blockIdx.x + blockIdx.y * 100;
+		output[AT(row, col, nr_cols)] = result[i];
+		output[AT(row, col, nr_cols)] = result[i];
 	}
 }
