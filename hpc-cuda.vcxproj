@@ -57,7 +57,6 @@
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <CodeGeneration>compute_75,sm_75</CodeGeneration>
       <PtxAsOptionV>true</PtxAsOptionV>
-      <MaxRegCount>64</MaxRegCount>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -79,7 +78,6 @@
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <CodeGeneration>compute_75,sm_75</CodeGeneration>
       <PtxAsOptionV>true</PtxAsOptionV>
-      <MaxRegCount>64</MaxRegCount>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>

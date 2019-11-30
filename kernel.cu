@@ -93,8 +93,6 @@ __global__ void basic_dev_Tmultiply(int nr_rows, int nr_cols, double* src, doubl
 
 	result[AT(row, col, nr_cols)] = elem;
 	result[AT(col, row, nr_cols)] = elem;
-
-
 }
 
 Matrix basic_Tmutliply(Matrix& input) {
@@ -180,7 +178,7 @@ constexpr int TILE_SIZE = BLOCK_SIZE;
 
 Matrix GetRandomInputMatrix() {
 	constexpr int TestRows = 5120;
-	constexpr int TestCols = 5120;
+	constexpr int TestCols = 10240;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
@@ -258,21 +256,22 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 	int m = 0;
 
 
-	sm_col_onX[0][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
-	sm_col_onY[0][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
+	sm_col_onX[0][ty][tx] = src[AT(m + ty, col_x, nr_cols)];
+	sm_col_onY[0][ty][tx] = src[AT(m + ty, col_y, nr_cols)];
 
 	for (; m < nr_rows;) {
 		__syncthreads();
 
 		m += TILE_SIZE;
 
-		sm_col_onX[1][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
-		sm_col_onY[1][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
+		sm_col_onX[1][ty][tx] = src[AT(m + ty, col_x, nr_cols)];
+		sm_col_onY[1][ty][tx] = src[AT(m + ty, col_y, nr_cols)];
 
 		#pragma unroll
 		for (int k = 0; k < TILE_SIZE; ++k) {
 			result += sm_col_onX[0][k][tx] * sm_col_onY[0][k][ty];
 		}
+
 
 		if (m >= nr_rows) {
 			break;
@@ -282,8 +281,8 @@ __device__ void dev_WriteResult(int nr_rows, int nr_cols, double* src, double* o
 		m += TILE_SIZE;
 
 
-		sm_col_onX[0][ty][tx] = src[AT_T(m + ty, col_x, nr_rows)];
-		sm_col_onY[0][ty][tx] = src[AT_T(m + ty, col_y, nr_rows)];
+		sm_col_onX[0][ty][tx] = src[AT(m + ty, col_x, nr_cols)];
+		sm_col_onY[0][ty][tx] = src[AT(m + ty, col_y, nr_cols)];
 
 		#pragma unroll
 		for (int k = 0; k < TILE_SIZE; ++k) {
@@ -324,10 +323,11 @@ __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double*
 
 
 
-constexpr int T_GRANUL = 4;
+constexpr int T_GRANUL = 8;
 constexpr int WORK_THREAD = TILE_SIZE / T_GRANUL;
 
 __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output);
+__global__ void opt_dev_Tmultiply_RegCache(int nr_rows, int nr_cols, double* src, double* output);
 
 Matrix opt_Tmutliply(Matrix& input) {
 	Matrix result(input.cols, input.cols);
@@ -335,7 +335,7 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 
 
-	input.IntoDevMatrix_ColMajor();
+	input.IntoDevMatrix();
 
 	constexpr int Threads = BLOCK_SIZE;
 	int GridSize = div_ceil(input.cols, TILE_SIZE);
@@ -347,11 +347,18 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 	optimisedTime = CountTime([&]() {
 		opt_dev_Tmultiply <<<grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
+	}); 
+
+	printf("Double Buffer: %f\n", optimisedTime);
+
+
+	optimisedTime = CountTime([&]() {
+		opt_dev_Tmultiply_RegCache << <grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
-
-	printf("Time 1: %f\n", optimisedTime);
-
 	
+	printf("RegCache: %f\n", optimisedTime);
+
+
 	//GridSize = div_ceil(input.cols, TILE_SIZE);
 	grid = dim3(GridSize, GridSize / T_GRANUL);
 
@@ -360,6 +367,9 @@ Matrix opt_Tmutliply(Matrix& input) {
 			opt_dev_TmultiplyOdd<< <grid, block>>> (input.rows, input.cols, input.dev_data, result.dev_data);
 		});
 	
+	printf("Granularity: %f\n", optimisedTime);
+
+
 	result.FromDevMatrix();
 
 	input.FreeDevice();
@@ -367,6 +377,108 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 	return result;
 }
+
+constexpr int RC_WORK = TILE_SIZE;
+
+
+__global__ void opt_dev_Tmultiply_RegCache(int nr_rows, int nr_cols, double* src, double* output)
+{
+	const int bx = blockIdx.x;
+	const int by = blockIdx.y;
+	
+	if (by > bx) {
+		return;
+	}
+
+	const int row = bx * TILE_SIZE + threadIdx.x;
+	const int col = by * TILE_SIZE + threadIdx.y;
+
+	const int tx = threadIdx.x;
+	const int ty = threadIdx.y;
+
+	const int block_start_x = bx * TILE_SIZE;
+	const int block_start_y = by * TILE_SIZE;
+
+
+	const int cl_ty = threadIdx.y;
+
+	// 
+	__shared__ double sm_col_onY[RC_WORK][TILE_SIZE];
+	__shared__ double sm_col_onX[RC_WORK][TILE_SIZE];
+
+	// Column to copy for this thread based on the C tile's x
+	const int col_x = block_start_x + tx;
+
+	// Column to copy for this thread based on the C tile's y
+	const int col_y = block_start_y + tx;
+
+	
+
+	double result = 0.0;
+	double reg_cache_X;
+	double reg_cache_Y;
+
+
+	int m = 0;
+
+	reg_cache_X = src[AT(m + cl_ty, col_x, nr_rows)];
+	reg_cache_Y = src[AT(m + cl_ty, col_y, nr_rows)];
+
+	
+	for (m = RC_WORK; m < nr_rows; m += RC_WORK) {
+		sm_col_onX[ty][tx] = reg_cache_X;
+		sm_col_onY[ty][tx] = reg_cache_Y;
+
+		__syncthreads();
+
+		reg_cache_X = src[AT(m + ty, col_x, nr_cols)];
+		reg_cache_Y = src[AT(m + ty, col_y, nr_cols)];
+
+		#pragma unroll
+		for (int k = 0; k < RC_WORK; ++k) {
+			result += sm_col_onX[k][tx] * sm_col_onY[k][ty];
+		}
+	} 
+
+	for (int k = 0; k < RC_WORK; ++k) {
+		sm_col_onX[ty][tx] = reg_cache_X;
+		sm_col_onY[ty][tx] = reg_cache_Y;
+
+		__syncthreads();
+		
+		#pragma unroll
+		for (int k = 0; k < RC_WORK; ++k) {
+			result += sm_col_onX[k][tx] * sm_col_onY[k][ty];
+		}
+	}
+
+
+	output[AT(row, col, nr_cols)] = result;
+	output[AT(col, row, nr_cols)] = result;
+	
+
+
+	constexpr DebugOutput db2 = DebugOutput::Result;
+
+	if (db2 == DebugOutput::Result) {
+
+	}
+	else if (db2 == DebugOutput::RowCol) {
+		output[AT(row, col, nr_cols)] = row + col * 100;
+	}
+	else if (db2 == DebugOutput::Thread) {
+		output[AT(row, col, nr_cols)] = threadIdx.x + threadIdx.y * 100;
+	}
+	else if (db2 == DebugOutput::Block) {
+		output[AT(row, col, nr_cols)] = blockIdx.x + blockIdx.y * 100;
+	}
+}
+
+
+
+
+
+
 
 // Using different techniques of optimization for Odd columns
 // enables us to disable double buffering for this case and have more registers to work with, 
@@ -408,12 +520,12 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 	// Column to copy for this thread based on the C tile's y
 	const int col_y = block_start_y + tx;
 
-	int m = 0;
+	int m = 0; 
 
 
 	double result[T_GRANUL];
-	double reg_cache_X;
-	double reg_cache_Y;
+	//double reg_cache_X;
+	//double reg_cache_Y;
 
 
 	#pragma unroll
@@ -422,20 +534,12 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 	}
 
 	
-	// Preload registers
-	reg_cache_X = src[AT_T(0 + cl_ty, col_x, nr_rows)];
-	reg_cache_Y = src[AT_T(0 + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
+	for (m = 0; m < nr_rows; m += WORK_THREAD) {
 
-	for (m = WORK_THREAD; m < nr_rows; m += WORK_THREAD) {
-
-		sm_col_onX[ty % WORK_THREAD][tx] = reg_cache_X;
-		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = reg_cache_Y;
+		sm_col_onX[ty % WORK_THREAD][tx]                   = src[AT(m + cl_ty, col_x, nr_cols)];;
+		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = src[AT(m + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_cols)];;
 
 		__syncthreads();
-
-
-		reg_cache_X = src[AT_T(m + cl_ty, col_x, nr_rows)];
-		reg_cache_Y = src[AT_T(m + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
 
 		#pragma unroll
 		for (int i = 0; i < T_GRANUL; ++i) {
@@ -445,15 +549,6 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 			}
 		}
 	} 
-
-	// Last results
-	#pragma unroll
-	for (int i = 0; i < T_GRANUL; ++i) {
-	#pragma unroll
-		for (int k = 0; k < WORK_THREAD; ++k) {
-			result[i] += sm_col_onX[k][tx] * sm_col_onY[i][k][ty];
-		}
-	}
 
 
 	#pragma unroll
