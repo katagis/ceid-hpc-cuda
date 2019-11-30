@@ -174,13 +174,13 @@ enum class DebugOutput {
 
 constexpr DebugOutput debugOutput = DebugOutput::Result;
 
-constexpr int BLOCK_SIZE = 8;
+constexpr int BLOCK_SIZE = 32;
 constexpr int TILE_SIZE = BLOCK_SIZE;
 
 
 Matrix GetRandomInputMatrix() {
-	constexpr int TestRows = 32;
-	constexpr int TestCols = 32;
+	constexpr int TestRows = 5120;
+	constexpr int TestCols = 5120;
 
 	Matrix inputMatrix(TestCols, TestRows);
 	inputMatrix.AllocHost();
@@ -346,7 +346,7 @@ Matrix opt_Tmutliply(Matrix& input) {
 	
 
 	optimisedTime = CountTime([&]() {
-		//opt_dev_Tmultiply <<<grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
+		opt_dev_Tmultiply <<<grid, block >> > (input.rows, input.cols, input.dev_data, result.dev_data);
 	});
 
 	printf("Time 1: %f\n", optimisedTime);
@@ -376,12 +376,12 @@ Matrix opt_Tmutliply(Matrix& input) {
 
 __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, double* output)
 {
-	if (blockIdx.y < blockIdx.x * T_GRANUL) {
-		return;
-	}
-
 	const int bx = blockIdx.x;
 	const int by = blockIdx.y * T_GRANUL;
+	
+	if (by > bx) {
+		return;
+	}
 
 	const int row = bx * TILE_SIZE + threadIdx.x;
 	const int col = by * TILE_SIZE + threadIdx.y;
@@ -410,19 +410,33 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 
 	int m = 0;
 
+
 	double result[T_GRANUL];
+	double reg_cache_X;
+	double reg_cache_Y;
+
 
 	#pragma unroll
 	for (int i = 0; i < T_GRANUL; ++i) {
 		result[i] = 0.0;
 	}
 
-	for (m = 0; m < nr_rows; m += WORK_THREAD) {
+	
+	// Preload registers
+	reg_cache_X = src[AT_T(0 + cl_ty, col_x, nr_rows)];
+	reg_cache_Y = src[AT_T(0 + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
 
-		sm_col_onX[ty % WORK_THREAD][tx] = src[AT_T(m + cl_ty, col_x, nr_rows)];
-		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = src[AT_T(m + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
+	for (m = WORK_THREAD; m < nr_rows; m += WORK_THREAD) {
+
+		sm_col_onX[ty % WORK_THREAD][tx] = reg_cache_X;
+		sm_col_onY[threadCopyOffset][ty % WORK_THREAD][tx] = reg_cache_Y;
 
 		__syncthreads();
+
+
+		reg_cache_X = src[AT_T(m + cl_ty, col_x, nr_rows)];
+		reg_cache_Y = src[AT_T(m + cl_ty, col_y + (threadCopyOffset * TILE_SIZE), nr_rows)];
+
 		#pragma unroll
 		for (int i = 0; i < T_GRANUL; ++i) {
 			#pragma unroll
@@ -432,14 +446,24 @@ __global__ void opt_dev_TmultiplyOdd(int nr_rows, int nr_cols, double* src, doub
 		}
 	} 
 
+	// Last results
+	#pragma unroll
+	for (int i = 0; i < T_GRANUL; ++i) {
+	#pragma unroll
+		for (int k = 0; k < WORK_THREAD; ++k) {
+			result[i] += sm_col_onX[k][tx] * sm_col_onY[i][k][ty];
+		}
+	}
+
+
 	#pragma unroll
 	for (int i = 0; i < T_GRANUL; ++i) {
 		int out_col = col + i * TILE_SIZE;
-	//	output[AT(row, out_col, nr_cols)] = result[i];
-	//	output[AT(out_col, row, nr_cols)] = result[i];
+		output[AT(row, out_col, nr_cols)] = result[i];
+		output[AT(out_col, row, nr_cols)] = result[i];
 		
-		output[AT(row, out_col, nr_cols)] = (blockIdx.x + blockIdx.y * 100 + i * 10000) + 1;
-		output[AT(out_col, row, nr_cols)] = (blockIdx.x + blockIdx.y * 100 + i * 10000) + 1;
+		//output[AT(row, out_col, nr_cols)] = (blockIdx.x * 10 + blockIdx.y * 100 + i);
+		//output[AT(out_col, row, nr_cols)] = (blockIdx.x + blockIdx.y * 100 + i * 10000) + 1;
 	}
 
 
