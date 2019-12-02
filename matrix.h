@@ -7,7 +7,7 @@
 // Represents manages a Matrix and its memory on Host and Device.
 // Automatically frees both Host & Device memory when going out of scope ensuring no memory leaks.
 struct Matrix {
-	// NOTE: Data is stored in row major. dev_data is dependant on the function IntoDevMatrix used.
+	// NOTE: Data is stored in row major. dev_data majorness is dependant on the function IntoDevMatrix used.
 	double* data{ nullptr };
 	double* dev_data{ nullptr };
 
@@ -16,7 +16,7 @@ struct Matrix {
 
 	Matrix() {}
 
-	__host__ Matrix(int inCols, int inRows) {
+	Matrix(int inCols, int inRows) {
 		cols = inCols;
 		rows = inRows;
 	}
@@ -141,9 +141,6 @@ struct Matrix {
 	//
 	// Misc utilities
 	//
-	double** Dev_As2D() {
-		return (double**)dev_data;
-	}
 
 	int Size() {
 		return rows * cols;
@@ -162,6 +159,7 @@ struct Matrix {
 		}
 	}
 
+private:
 	// mallocs the temporary returned buffer, you should free after use
 	double* Transposed() {
 		double* t = (double*)malloc(Size() * sizeof(double));
@@ -174,8 +172,9 @@ struct Matrix {
 		return t;
 	}
 
+public:
 	// Compares Host Data with "other's" data. Costs O(N) when equal because we need to apply delta to each value
-	bool IsNearlyEqual(const Matrix& other, double delta = 1e-3) {
+	bool IsDeltaEqual(const Matrix& other, double delta = 1e-3) {
 		if (cols != other.cols || rows != other.rows) {
 			return false;
 		}
