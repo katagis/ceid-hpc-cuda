@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+
 // Contains our "Matrix" class that represents a unified matrix with both cpu and gpu data
 // along with utility functions for memory allocations and host <-> device transfers.
 // This class automatically deallocates all its host and device resources when going out of scope.
@@ -98,13 +99,16 @@ Matrix basic_Tmutliply(Matrix& input);
 int main() {
 	std::vector<std::pair<int, int>> TestSizes;
 	
+	// NOTE: The original tests may use up to 10 gb of host memory.
+	// For easier running and stability the test sizes have been reduced in the source code 
+	// after gathering execution data
 
-	for (int i = 1024; i <= 12288; i = i += 1024)	{
+	for (int i = 1024; i <= 8500; i = i += 1024)	{
 		TestSizes.push_back({ i, i });
 	}
 
-	for (int i = 1024; i < 12288; i = i << 1) {
-		TestSizes.push_back({ i / 2, i });
+	for (int i = 1000; i <= 9000; i += 1000) {
+		TestSizes.push_back({ div_ceil(i, 3), i });
 	}
 
 	std::right(std::cout);
@@ -115,8 +119,6 @@ int main() {
 		std::setw(10) << "cublas" << 
 		std::setw(10) << "basic" <<
 		std::setw(10) << "optim" << std::endl;
-
-	//printf("Rows,   Cols,   cublas, basic, optimis\n");
 
 	cudaSetDevice(0); CE;
 
@@ -170,10 +172,10 @@ Matrix cublas_Tmultiply(Matrix& inputMatrix) {
 	const double beta = 0;
 
 	Matrix result(inputMatrix.cols, inputMatrix.cols);
-	result.AllocDevice();
+	result.AllocDevice(); // Allocates device memory for this matrix using cudaMalloc
 
-	// Upload the texture to the device directly in Column Major
-	inputMatrix.IntoDevMatrix_ColMajor();
+	inputMatrix.IntoDevMatrix_ColMajor(); // Uploads the buffer to the device memory directly in Column Major using cudaMemcpy
+
 	
 	cublasHandle_t handle;
 	auto status = cublasCreate(&handle); CBE(status);
@@ -195,10 +197,10 @@ Matrix cublas_Tmultiply(Matrix& inputMatrix) {
 	cublasDestroy(handle);
 
 
-	result.FromDevMatrix_ColMajor();
+	result.FromDevMatrix_ColMajor(); // Retrieves the buffer from device memory in cpu memroy of the matrix using cudaMemcpy
 
-	result.FreeDevice();
-	inputMatrix.FreeDevice();
+	result.FreeDevice(); // cudaFrees result's device memroy
+	inputMatrix.FreeDevice();// cudaFrees the result device memroy
 
 	return std::move(result);
 }
@@ -264,43 +266,28 @@ Matrix basic_Tmutliply(Matrix& input) {
 // 2. Tile based
 // 3. Double buffering
 // 4. Supports matrix sizes that misalign with the block size
-
-// Optimisations done based on:
-
-// CUDA Toolkit Documentation cuBLAS - https://docs.nvidia.com/cuda/cublas/index.html
-// CUDA Performance Considerations - https://www.seas.upenn.edu/~cis565/Lectures2011S/Lecture12.pdf // Prefetch, Thread Granularity, Loop unrolling
-// Matrix Multiplication CUDA - https://ecatue.gitlab.io/gpu2018/pages/Cookbook/matrix_multiplication_cuda.html#5
-// DGEMM - Tiled matrix multiplication with Cuda - https://www.fz-juelich.de/SharedDocs/Downloads/IAS/JSC/EN/slides/cuda/10-cuda-dgemm-tiled.pdf // Tiled matrix multiplication
-// CUDA Advanced Techniques 3 - https://cs.nyu.edu/courses/fall15/CSCI-GA.3033-004/cuda-advanced-3.pdf
-
-
-// What we tried:
-// Input as Column Major: Performance got worse probably due to worse memory access patterns
-// Register Prefech: similar performance to double buffering, not enough registers for misaligned matrixes.
-// Reduce overhead by launching half of total grid for exact triangle: ran out of registers (code for detecting row & column requires sizable code for math)
-// NOTE: we could have implemented this instead of misaligned size support but the observed speed-up during testing was minimal
 //
-// Thread Granularity: 
+
+//
+// Notes about Thread Granularity (not implemented): 
 // We tried multiple thread granularity implementations: 1x2, 1x4, 2x2, 3x3.
 // In our tests thread granularity performed better than most other optmisations.
-// The main limitation of granularity was the resources required. 
+// The main limitation of granularity was the resources required (shared memory & registers). 
 // Due to that, we could not combine thread granularity with any memory prefetch methods (double buffering / register prefetch) without running out of thread resources.
-// In the end the simple double buffering was just faster than granularity without memory prefetch.
+// In the end the simple double buffering was just faster than just granularity without memory prefetch.
 //
-
-// Future work:
-// Handle Bx == By with a different context launch in another stream, would allow for a more memory efficient kernel, also would reduce bank conflicts that exist only in these cases
 
 __device__ void opt_dev_Tmultiply_Impl(int nr_rows, int nr_cols, double* src, double* output, const int res_row, const int res_col);
 
-// Basic handler for the actual function. Handles the trianglular array and debugging
 //
-// For TILE_SIZE = 32 this uses:
+// For TILE_SIZE = 32 this kernel uses:
 // ptxas: 62 registers, 32768 bytes smem, 376 bytes cmem[0]
 // 
-// which matches extactly what our device supports:
+// which matches extactly what our device supports for max occupancy:
 // 64 registers and 32768 bytes shared mem per thread
 //
+
+// Basic handler for the actual function. Handles the trianglular array and debugging
 __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double* result)
 {
 	// Handles Symmetrical triangle
@@ -331,6 +318,7 @@ __global__ void opt_dev_Tmultiply(int nr_rows, int nr_cols, double* src, double*
 	}
 }
 
+// The actual algorithm kernel
 __device__ void opt_dev_Tmultiply_Impl(int nr_rows, int nr_cols, double* src, double* output, const int res_row, const int res_col)
 {
 	// transpose(A) * A in practice means we multiply between 2 columns of the src.
@@ -361,11 +349,11 @@ __device__ void opt_dev_Tmultiply_Impl(int nr_rows, int nr_cols, double* src, do
 
 	// Column to copy for this thread based on the C tile's y
 	const int col_y = block_start_y + tx;
-
 	// Note: we copy based on threadX for both columns 
 
 
-	// Overflows on each dimension and in general for this particlar thread
+
+	// Stores overflow states on each dimension and in general for this particlar thread
 	const int overflows_x = block_start_x + tx >= nr_cols; 
 	const int overflows_y = block_start_y + tx >= nr_cols;
 	const int overflows = res_row >= nr_cols || res_col >= nr_cols;
